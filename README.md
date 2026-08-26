@@ -1,55 +1,47 @@
-# CausalMVC BDGP Clean
+# ST-MCC
 
-这是当前稳定 BDGP 模型的单入口整理版，不依赖 `v2/v3/fixed/stable_final` 等历史脚本。
-
+ST-MCC: Structure-Teacher-Guided Multi-Level Consistency Learning and Cross-View Latent Completion for Incomplete Multi-View Clustering
 ## 文件职责
 
-| 文件 | 职责 |
+| File | Responsibility |
 |---|---|
-| `train.py` | 唯一训练入口、20+10 两阶段训练、最终评估与保存 |
-| `model.py` | 编码器、Common/Specific 分解、解码器、GRL、共享原型和跨视图预测器 |
-| `config.py` | 少量常用实验参数及命令行解析 |
-| `unit.py` | 结构教师、损失函数、EMA 原型更新、聚类指标 |
-| `data_load.py` | BDGP 加载、L2 归一化和无标签缺失 mask |
+| `train.py` | Sole training entry point, 20+10 two-stage training, final evaluation and model saving |
+| `model.py` | Encoders, Common/Specific decomposition, decoders, GRL, shared prototypes, and cross-view predictors |
+| `config.py` | A small set of commonly used experimental parameters and command-line argument parsing |
+| `unit.py` | Structure teacher, loss functions, EMA prototype updates, and clustering metrics |
+| `data_load.py` | BDGP data loading, L2 normalization, and label-free missing-view mask |
+## Trainning 
 
-## 训练流程
+1. Construct a fixed structure teacher and pseudo-labels from the observed data.
+2. First 20 epochs: use only Masked Reconstruction, where both Common and Specific representations participate in reconstruction.
+3. Last 10 epochs: jointly optimize Reconstruction, GRL, Pair, PAM, Structure, and Cross-view Loss.
+4. Use the Cross Predictor to complete the missing views with 128-dimensional latent representations.
+5. Average and normalize the two completed Common representations, then perform KMeans clustering.
 
-1. 从观测数据构建固定结构教师与伪标签。
-2. 前 20 epoch：仅使用 Masked Reconstruction，Common 和 Specific 共同参与重构。
-3. 后 10 epoch：联合优化 Reconstruction、GRL、Pair、PAM、Structure 和 Cross-view Loss。
-4. 使用 Cross Predictor 补全缺失视图的 128 维潜表示。
-5. 对两个补全后的 Common 表示求均值、归一化并执行 KMeans。
-
-当前版本已经移除最终稳定日程中从未触发的 Orthogonality、Cluster Head CE 和 Balance 分支。
-
-## Terminal 运行
+The current version has removed the Orthogonality, Cluster Head CE, and Balance branches, which were never activated in the final stabilized training schedule.
+## Running 
 
 ```powershell
-cd D:\Data_Mining\Code\Experiment\CausalMVC\bdgp_clean
-powershell -ExecutionPolicy Bypass -File .\run_train.ps1
+python train.py --seed 61
 ```
 
-指定训练种子和独立 mask 种子：
+
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File .\run_train.ps1 -Seed 61 -MaskSeed 61
 ```
 
-指定数据和输出目录：
+Specify the dataset and output directory:
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File .\run_train.ps1 `
-  -Data "D:\Data_Mining\Code\Datasets\BDGP\BDGP.mat" `
-  -Output "outputs\bdgp_clean"
+  -Data "./Datasets/BDGP/BDGP.mat" `
+  -Output "outputs\bdgp_result"
 ```
+`run_train.ps1` reuses the verified `lycenv` dependency environment of the current project. If this environment has already been properly activated in your terminal, you can also directly run `python train.py`.
 
-`run_train.ps1` 复用当前项目已经验证的 `lycenv` 依赖环境；如果你的终端已经正确激活该环境，也可以直接执行 `python train.py`。
-
-常规实验只暴露 `data/output/seed/mask-seed/missing-rate` 五个命令行参数。网络维度、损失权重和教师细节属于已验证稳定方案，分别固定在实际使用它们的模块附近。
-
-## 输出
-
-- `outputs/bdgp_clean/seed_61.json`：配置、逐 epoch 损失、教师诊断及最终 ACC/NMI/ARI/PUR。
-- `outputs/bdgp_clean/seed_61.pt`：模型参数、输入维度和配置。
-
-真实标签不会进入结构教师、损失函数或 checkpoint 选择，只用于最终指标报告。
+For standard experiments, only five command-line arguments are exposed: `data/output/seed/mask-seed/missing-rate`. The network dimensions, loss weights, and teacher-related details belong to the validated stable configuration and are fixed close to the modules where they are actually used.
+## Output
+- `outputs/bdgp_clean/seed_61.json`: Configuration, per-epoch losses, teacher diagnostics, and final ACC/NMI/ARI/PUR results.
+- `outputs/bdgp_clean/seed_61.pt`: Model parameters, input dimensions, and configuration.
+Ground-truth labels are not used in the structure teacher, loss functions, or checkpoint selection, and are used only for final metric reporting.
