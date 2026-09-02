@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 import random
 from dataclasses import dataclass
 
@@ -23,8 +24,7 @@ from sklearn.svm import SVC
 from model import CausalMVC, ModelOutput
 
 
-# Frozen stable-recipe constants. They are not routine command-line knobs.
-NUM_CLUSTERS = 5
+# Stable internal defaults. Dataset-dependent quantities are derived at runtime.
 TEACHER_DIM = 256
 RIDGE_ALPHA = 1.0
 PROTOTYPE_TEMPERATURE = 0.2
@@ -35,6 +35,9 @@ PROTOTYPE_MOMENTUM = 0.9
 class TeacherOutput:
     views: list[np.ndarray]
     pseudo_labels: np.ndarray
+    probabilities: np.ndarray
+    confidence: np.ndarray
+    sample_weights: np.ndarray
     diagnostics: dict
 
 
@@ -73,8 +76,10 @@ def clustering_metrics(y_true: np.ndarray, y_pred: np.ndarray) -> dict[str, floa
     }
 
 
-def kmeans_metrics(embedding: np.ndarray, labels: np.ndarray, seed: int) -> dict[str, float]:
-    prediction = KMeans(NUM_CLUSTERS, n_init=20, random_state=seed).fit_predict(embedding)
+def kmeans_metrics(
+    embedding: np.ndarray, labels: np.ndarray, seed: int, num_clusters: int
+) -> dict[str, float]:
+    prediction = KMeans(num_clusters, n_init=20, random_state=seed).fit_predict(embedding)
     return clustering_metrics(labels, prediction)
 
 
@@ -88,7 +93,7 @@ def recover_teacher_views(full_views: list[np.ndarray], mask: np.ndarray, seed: 
     projected: list[np.ndarray] = []
     for view, features in enumerate(full_views):
         observed = mask[:, view].astype(bool)
-        dimension = min(TEACHER_DIM, features.shape[1], int(observed.sum()))
+        dimension = min(TEACHER_DIM, features.shape[1], max(1, int(observed.sum()) - 1))
         pca = PCA(dimension, random_state=seed).fit(features[observed])
         latent = np.zeros((len(features), dimension), dtype=np.float32)
         latent[observed] = pca.transform(features[observed]).astype(np.float32)
@@ -103,6 +108,7 @@ def recover_teacher_views(full_views: list[np.ndarray], mask: np.ndarray, seed: 
 
 
 def graph_from_embedding(embedding: np.ndarray, neighbors: int) -> csr_matrix:
+    neighbors = min(max(1, neighbors), len(embedding) - 1)
     distances, indices = NearestNeighbors(
         n_neighbors=neighbors + 1, metric="cosine", n_jobs=-1
     ).fit(embedding).kneighbors(embedding)
@@ -116,40 +122,106 @@ def graph_from_embedding(embedding: np.ndarray, neighbors: int) -> csr_matrix:
     return graph.maximum(graph.T)
 
 
-def select_graph_labels(embedding: np.ndarray) -> tuple[np.ndarray, dict]:
-    """Choose graph density using cluster balance and cosine silhouette only."""
+def _neighbor_candidates(num_samples: int, num_clusters: int) -> list[int]:
+    """Scale graph density with the expected local cluster population."""
 
-    expected_size = len(embedding) / NUM_CLUSTERS
-    diagnostics: dict = {}
-    pseudo_labels: np.ndarray | None = None
-    for neighbors in (20, 25, 30, 35, 40):
+    upper = max(1, min(50, num_samples - 1))
+    scale = math.sqrt(max(num_samples / max(num_clusters, 1), 1.0))
+    values = {
+        min(upper, max(2, int(round(scale * multiplier))))
+        for multiplier in (0.5, 1.0, 2.0)
+    }
+    return sorted(values)
+
+
+def _align_assignments(
+    reference: np.ndarray, candidate: np.ndarray, num_clusters: int
+) -> np.ndarray:
+    """Align arbitrary spectral-cluster IDs without consulting ground truth."""
+
+    table = np.zeros((num_clusters, num_clusters), dtype=np.int64)
+    for source, target in zip(candidate, reference):
+        table[int(source), int(target)] += 1
+    rows, columns = linear_sum_assignment(table.max() - table)
+    mapping = np.arange(num_clusters, dtype=np.int64)
+    mapping[rows] = columns
+    return mapping[candidate]
+
+
+def select_graph_labels(
+    embedding: np.ndarray, num_clusters: int
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, dict]:
+    """Build a soft graph ensemble without assuming balanced true classes."""
+
+    candidates: list[dict] = []
+    for neighbors in _neighbor_candidates(len(embedding), num_clusters):
         graph = graph_from_embedding(embedding, neighbors)
-        pseudo_labels = SpectralClustering(
-            NUM_CLUSTERS,
+        labels = SpectralClustering(
+            num_clusters,
             affinity="precomputed",
             assign_labels="cluster_qr",
             random_state=0,
         ).fit_predict(graph).astype(np.int64)
-        sizes = np.bincount(pseudo_labels, minlength=NUM_CLUSTERS)
+        sizes = np.bincount(labels, minlength=num_clusters)
+        proportions = sizes / max(len(labels), 1)
+        entropy = float(
+            -(proportions[proportions > 0] * np.log(proportions[proportions > 0])).sum()
+            / max(math.log(num_clusters), 1e-12)
+        )
         silhouette = float(
             silhouette_score(
                 embedding,
-                pseudo_labels,
+                labels,
                 metric="cosine",
                 sample_size=min(1000, len(embedding)),
                 random_state=0,
             )
         )
-        diagnostics = {
-            "graph_neighbors": neighbors,
-            "silhouette": silhouette,
-            "cluster_sizes": sizes.tolist(),
-        }
-        balanced = sizes.min() >= 0.5 * expected_size and sizes.max() <= 1.5 * expected_size
-        if balanced and silhouette >= 0.187:
-            break
-    assert pseudo_labels is not None
-    return pseudo_labels, diagnostics
+        candidates.append(
+            {
+                "neighbors": neighbors,
+                "labels": labels,
+                "sizes": sizes,
+                "silhouette": silhouette,
+                "entropy": entropy,
+                "collapsed": bool(proportions.max() > 0.8 or np.count_nonzero(sizes) < num_clusters),
+            }
+        )
+
+    admissible = [item for item in candidates if not item["collapsed"]] or candidates
+    selected = max(admissible, key=lambda item: (item["silhouette"], item["entropy"]))
+    aligned = [
+        _align_assignments(selected["labels"], item["labels"], num_clusters)
+        for item in candidates
+    ]
+    probabilities = np.zeros((len(embedding), num_clusters), dtype=np.float64)
+    for labels in aligned:
+        probabilities[np.arange(len(labels)), labels] += 1.0
+    probabilities /= len(aligned)
+    pseudo_labels = probabilities.argmax(axis=1).astype(np.int64)
+    confidence = probabilities.max(axis=1).astype(np.float32)
+    stability = float(
+        np.mean(
+            [adjusted_rand_score(selected["labels"], item["labels"]) for item in candidates]
+        )
+    )
+    diagnostics = {
+        "graph_neighbors": int(selected["neighbors"]),
+        "silhouette": float(selected["silhouette"]),
+        "cluster_sizes": np.bincount(pseudo_labels, minlength=num_clusters).tolist(),
+        "cluster_entropy": float(selected["entropy"]),
+        "graph_stability": stability,
+        "graph_candidates": [
+            {
+                "neighbors": int(item["neighbors"]),
+                "silhouette": float(item["silhouette"]),
+                "cluster_entropy": float(item["entropy"]),
+                "collapsed": bool(item["collapsed"]),
+            }
+            for item in candidates
+        ],
+    }
+    return pseudo_labels, probabilities.astype(np.float32), confidence, diagnostics
 
 
 def _svc_vote(
@@ -157,9 +229,14 @@ def _svc_vote(
     train_labels: np.ndarray,
     predict_features: np.ndarray,
     c_value: float,
+    num_clusters: int,
 ) -> tuple[float, np.ndarray]:
+    if np.unique(train_labels).size < 2:
+        return 0.0, np.full(
+            (len(predict_features), num_clusters), 1.0 / num_clusters, dtype=np.float64
+        )
     classifier = SVC(C=c_value, gamma="scale", random_state=0)
-    class_counts = np.bincount(train_labels, minlength=NUM_CLUSTERS)
+    class_counts = np.bincount(train_labels, minlength=num_clusters)
     present_counts = class_counts[class_counts > 0]
     folds = min(3, int(present_counts.min()))
     if folds >= 2:
@@ -172,83 +249,150 @@ def _svc_vote(
     if decisions.ndim == 1:
         decisions = np.column_stack((-decisions, decisions))
     probabilities = softmax(decisions, axis=1)
-    full_probabilities = np.zeros((len(predict_features), NUM_CLUSTERS), dtype=np.float64)
+    full_probabilities = np.zeros((len(predict_features), num_clusters), dtype=np.float64)
     full_probabilities[:, classifier.classes_.astype(int)] = probabilities
     return score, full_probabilities
 
 
-def refine_view1_missing_labels(
+def _pca_features(
+    features: np.ndarray, observed: np.ndarray, seed: int
+) -> dict[str, np.ndarray]:
+    spaces: dict[str, np.ndarray] = {"raw": features}
+    maximum = max(1, int(observed.sum()) - 1)
+    for requested in (128, TEACHER_DIM):
+        dimension = min(requested, features.shape[1], maximum)
+        name = f"pca_{dimension}"
+        if name not in spaces:
+            pca = PCA(dimension, random_state=seed).fit(features[observed])
+            spaces[name] = pca.transform(features).astype(np.float32)
+    return spaces
+
+
+def refine_missing_probabilities(
     full_views: list[np.ndarray],
     mask: np.ndarray,
-    pseudo_labels: np.ndarray,
+    probabilities: np.ndarray,
     seed: int,
+    num_clusters: int,
 ) -> tuple[np.ndarray, dict]:
-    """Refine the empirically weak BDGP direction: view 0 observed, view 1 missing."""
+    """Refine both missing directions using only the genuinely observed source."""
 
     paired = mask.astype(bool).all(axis=1)
-    weak_missing = (mask[:, 0] == 1) & (mask[:, 1] == 0)
-    if not weak_missing.any():
-        return pseudo_labels.copy(), {"refined_samples": 0, "svc_weights": []}
+    labels = probabilities.argmax(axis=1)
+    refined = probabilities.astype(np.float64).copy()
+    chance = 1.0 / num_clusters
+    direction_diagnostics: list[dict] = []
 
-    observed0 = mask[:, 0].astype(bool)
-    observed1 = mask[:, 1].astype(bool)
-    votes: list[np.ndarray] = []
-    weights: list[float] = []
+    for target, source in ((0, 1), (1, 0)):
+        missing = (mask[:, target] == 0) & (mask[:, source] == 1)
+        if not missing.any():
+            direction_diagnostics.append(
+                {"source": source, "target": target, "samples": 0, "weights": []}
+            )
+            continue
 
-    view0_features: dict[str, np.ndarray] = {"raw": full_views[0]}
-    for requested_dim in (128, 512):
-        dimension = min(requested_dim, full_views[0].shape[1], int(observed0.sum()))
-        pca = PCA(dimension, random_state=0).fit(full_views[0][observed0])
-        view0_features[f"pca_{requested_dim}"] = pca.transform(full_views[0]).astype(np.float32)
+        source_observed = mask[:, source].astype(bool)
+        target_observed = mask[:, target].astype(bool)
+        feature_spaces = _pca_features(full_views[source], source_observed, seed)
+        votes: list[np.ndarray] = []
+        weights: list[float] = []
+        for name, features in feature_spaces.items():
+            c_value = 10.0 if name == "raw" else 1.0
+            score, vote = _svc_vote(
+                features[paired], labels[paired], features[missing], c_value, num_clusters
+            )
+            votes.append(vote)
+            weights.append(max(score - chance, 0.0))
 
-    for name, c_value in (("pca_128", 1.0), ("pca_512", 10.0), ("raw", 10.0)):
-        score, vote = _svc_vote(
-            view0_features[name][paired], pseudo_labels[paired], view0_features[name][weak_missing], c_value
+        source_dim = min(
+            TEACHER_DIM, full_views[source].shape[1], max(1, int(source_observed.sum()) - 1)
         )
+        target_dim = min(
+            TEACHER_DIM, full_views[target].shape[1], max(1, int(target_observed.sum()) - 1)
+        )
+        pca_source = PCA(source_dim, random_state=seed).fit(full_views[source][source_observed])
+        pca_target = PCA(target_dim, random_state=seed).fit(full_views[target][target_observed])
+        source_latent = pca_source.transform(full_views[source])
+        target_latent = pca_target.transform(full_views[target])
+        mapper = Ridge(RIDGE_ALPHA).fit(source_latent[paired], target_latent[paired])
+        simulated = np.concatenate(
+            (
+                Normalizer().fit_transform(source_latent),
+                Normalizer().fit_transform(mapper.predict(source_latent)),
+            ),
+            axis=1,
+        )
+        simulated_candidates = [
+            (*_svc_vote(simulated[paired], labels[paired], simulated[missing], c, num_clusters), c)
+            for c in (0.1, 1.0, 10.0)
+        ]
+        score, vote, selected_c = max(simulated_candidates, key=lambda item: item[0])
         votes.append(vote)
-        weights.append(max(score - 0.2, 0.0))
+        weights.append(max(score - chance, 0.0))
 
-    pca0_dim = min(TEACHER_DIM, full_views[0].shape[1], int(observed0.sum()))
-    pca1_dim = min(79, full_views[1].shape[1], int(observed1.sum()))
-    pca0 = PCA(pca0_dim, random_state=seed).fit(full_views[0][observed0])
-    pca1 = PCA(pca1_dim, random_state=seed).fit(full_views[1][observed1])
-    latent0 = pca0.transform(full_views[0])
-    latent1 = pca1.transform(full_views[1])
-    mapper = Ridge(RIDGE_ALPHA).fit(latent0[paired], latent1[paired])
-    simulated = np.concatenate(
-        (
-            Normalizer().fit_transform(latent0),
-            Normalizer().fit_transform(mapper.predict(latent0)),
-        ),
-        axis=1,
-    )
-    candidates = [
-        (*_svc_vote(simulated[paired], pseudo_labels[paired], simulated[weak_missing], c_value), c_value)
-        for c_value in (0.1, 1.0, 10.0)
-    ]
-    score, vote, _ = max(candidates, key=lambda item: item[0])
-    votes.append(vote)
-    weights.append(max(score - 0.2, 0.0))
+        weight_sum = sum(weights)
+        if weight_sum > 1e-12:
+            combined = refined[missing] + sum(
+                weight * vote for weight, vote in zip(weights, votes)
+            )
+            refined[missing] = combined / (1.0 + weight_sum)
+        direction_diagnostics.append(
+            {
+                "source": source,
+                "target": target,
+                "samples": int(missing.sum()),
+                "weights": [float(weight) for weight in weights],
+                "simulated_c": float(selected_c),
+            }
+        )
 
-    refined = pseudo_labels.copy()
-    weight_sum = sum(weights)
-    if weight_sum > 1e-12:
-        combined = sum(weight * vote for weight, vote in zip(weights, votes)) / weight_sum
-        refined[weak_missing] = combined.argmax(axis=1)
-    return refined, {"refined_samples": int(weak_missing.sum()), "svc_weights": weights}
+    refined /= refined.sum(axis=1, keepdims=True).clip(min=1e-12)
+    return refined.astype(np.float32), {
+        "refined_samples": int((~mask.astype(bool)).sum()),
+        "refinement_directions": direction_diagnostics,
+    }
 
 
-def build_structure_teacher(full_views: list[np.ndarray], mask: np.ndarray, seed: int) -> TeacherOutput:
+def build_structure_teacher(
+    full_views: list[np.ndarray], mask: np.ndarray, seed: int, num_clusters: int
+) -> TeacherOutput:
     """Return continuous teacher views and label-free cluster assignments."""
 
     recovered = recover_teacher_views(full_views, mask, seed)
     embedding = np.concatenate(recovered, axis=1)
-    pseudo_labels, graph_diagnostics = select_graph_labels(embedding)
-    pseudo_labels, refinement_diagnostics = refine_view1_missing_labels(
-        full_views, mask, pseudo_labels, seed
+    _, probabilities, _, graph_diagnostics = select_graph_labels(embedding, num_clusters)
+    probabilities, refinement_diagnostics = refine_missing_probabilities(
+        full_views, mask, probabilities, seed, num_clusters
     )
-    diagnostics = {**graph_diagnostics, **refinement_diagnostics}
-    return TeacherOutput(recovered, pseudo_labels, diagnostics)
+    pseudo_labels = probabilities.argmax(axis=1).astype(np.int64)
+    confidence = probabilities.max(axis=1).astype(np.float32)
+    confidence_floor = float(np.quantile(confidence, 0.25))
+    if confidence_floor >= 1.0 - 1e-6:
+        sample_weights = np.ones_like(confidence)
+    else:
+        sample_weights = np.clip(
+            (confidence - confidence_floor) / max(1.0 - confidence_floor, 1e-6), 0.0, 1.0
+        ).astype(np.float32)
+    for cluster in range(num_clusters):
+        members = np.flatnonzero(pseudo_labels == cluster)
+        if members.size and not np.any(sample_weights[members] > 0):
+            sample_weights[members[np.argmax(confidence[members])]] = 1.0
+    diagnostics = {
+        **graph_diagnostics,
+        **refinement_diagnostics,
+        "confidence_floor": confidence_floor,
+        "confidence_mean": float(confidence.mean()),
+        "confidence_min": float(confidence.min()),
+        "high_confidence_samples": int((sample_weights > 0).sum()),
+    }
+    return TeacherOutput(
+        recovered,
+        pseudo_labels,
+        probabilities,
+        confidence,
+        sample_weights,
+        diagnostics,
+    )
 
 
 def masked_reconstruction_loss(
@@ -264,30 +408,72 @@ def masked_reconstruction_loss(
     return torch.stack(losses).mean()
 
 
-def prototype_loss(common: torch.Tensor, targets: torch.Tensor, prototypes: torch.Tensor) -> torch.Tensor:
+def prototype_loss(
+    common: torch.Tensor,
+    soft_targets: torch.Tensor,
+    sample_weights: torch.Tensor,
+    prototypes: torch.Tensor,
+) -> torch.Tensor:
+    """Confidence-weighted soft distillation normalized for the class count."""
+
     similarity = F.normalize(common, dim=1) @ F.normalize(prototypes, dim=1).t()
-    return F.cross_entropy(similarity / PROTOTYPE_TEMPERATURE, targets)
+    log_probabilities = F.log_softmax(similarity / PROTOTYPE_TEMPERATURE, dim=1)
+    per_sample = -(soft_targets * log_probabilities).sum(dim=1)
+    weighted = (per_sample * sample_weights).sum() / sample_weights.sum().clamp_min(1e-8)
+    return weighted / max(math.log(prototypes.shape[0]), 1e-8)
 
 
 @torch.no_grad()
-def update_prototypes(
+def update_global_prototypes(
     model: CausalMVC,
-    commons: list[torch.Tensor],
-    targets: torch.Tensor,
-    valid_masks: list[torch.Tensor],
-) -> None:
-    for cluster in range(model.num_clusters):
-        members = []
+    views: list[torch.Tensor],
+    mask: torch.Tensor,
+    soft_targets: torch.Tensor,
+    sample_weights: torch.Tensor,
+    batch_size: int,
+    *,
+    momentum: float = PROTOTYPE_MOMENTUM,
+) -> list[float]:
+    """Update shared prototypes once from the complete dataset, not per batch."""
+
+    sums = model.prototypes.new_zeros(model.num_clusters, model.prototypes.shape[1])
+    masses = model.prototypes.new_zeros(model.num_clusters)
+    was_training = model.training
+    model.eval()
+    for start in range(0, len(mask), batch_size):
+        end = min(start + batch_size, len(mask))
+        output = model([view[start:end] for view in views])
+        probabilities = soft_targets[start:end]
+        confidence = sample_weights[start:end]
         for view in range(2):
-            selected = valid_masks[view] & (targets == cluster)
-            if selected.any():
-                members.append(commons[view][selected])
-        if members:
-            center = F.normalize(torch.cat(members).mean(dim=0), dim=0)
-            model.prototypes[cluster].mul_(PROTOTYPE_MOMENTUM).add_(
-                center * (1.0 - PROTOTYPE_MOMENTUM)
-            )
+            valid = mask[start:end, view]
+            if not valid.any():
+                continue
+            common = F.normalize(output.commons[view][valid], dim=1)
+            assignments = probabilities[valid] * confidence[valid].unsqueeze(1)
+            sums.add_(assignments.t().matmul(common))
+            masses.add_(assignments.sum(dim=0))
+    for cluster in range(model.num_clusters):
+        if masses[cluster] > 1e-8:
+            center = F.normalize(sums[cluster] / masses[cluster], dim=0)
+            model.prototypes[cluster].mul_(momentum).add_(center * (1.0 - momentum))
     model.prototypes.copy_(F.normalize(model.prototypes, dim=1))
+    model.train(was_training)
+    return masses.detach().cpu().tolist()
+
+
+def common_variance_loss(
+    commons: list[torch.Tensor], valid_masks: list[torch.Tensor]
+) -> torch.Tensor:
+    """Prevent the normalized common representation from becoming constant."""
+
+    available = [common[valid] for common, valid in zip(commons, valid_masks) if valid.any()]
+    if not available:
+        return commons[0].new_zeros(())
+    representation = F.normalize(torch.cat(available, dim=0), dim=1)
+    standard_deviation = torch.sqrt(representation.var(dim=0, unbiased=False) + 1e-4)
+    target = 1.0 / math.sqrt(representation.shape[1])
+    return F.relu(target - standard_deviation).pow(2).mean() / (target * target)
 
 
 def linear_structure_alignment(common: torch.Tensor, teacher: torch.Tensor) -> torch.Tensor:
@@ -304,20 +490,14 @@ def linear_structure_alignment(common: torch.Tensor, teacher: torch.Tensor) -> t
 def cross_view_loss(
     model: CausalMVC,
     output: ModelOutput,
-    views: list[torch.Tensor],
     paired: torch.Tensor,
 ) -> torch.Tensor:
     if not paired.any():
         return output.latents[0].new_zeros(())
 
-    predicted1 = model.cross_predictors[0](output.latents[0][paired])
-    predicted0 = model.cross_predictors[1](output.latents[1][paired])
-    latent_loss = (
-        1.0 - F.cosine_similarity(predicted1, output.latents[1][paired].detach()).mean()
-        + 1.0 - F.cosine_similarity(predicted0, output.latents[0][paired].detach()).mean()
+    predicted1 = model.cross_predictors[0](output.commons[0][paired])
+    predicted0 = model.cross_predictors[1](output.commons[1][paired])
+    return (
+        1.0 - F.cosine_similarity(predicted1, output.commons[1][paired].detach()).mean()
+        + 1.0 - F.cosine_similarity(predicted0, output.commons[0][paired].detach()).mean()
     ) / 2.0
-    feature_loss = (
-        F.mse_loss(model.decode_latent(predicted1, 1), views[1][paired])
-        + F.mse_loss(model.decode_latent(predicted0, 0), views[0][paired])
-    ) / 2.0
-    return latent_loss + feature_loss

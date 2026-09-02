@@ -1,4 +1,4 @@
-"""Neural modules for the clean two-view CausalMVC implementation."""
+"""Neural modules for the stable two-view ST-MCC implementation."""
 
 from __future__ import annotations
 
@@ -49,10 +49,11 @@ class ModelOutput:
 
 
 class CausalMVC(nn.Module):
-    """Two-view common/specific autoencoder with shared prototypes.
+    """Two-view common/specific autoencoder with shared global prototypes.
 
-    The stable BDGP architecture is intentionally frozen here. The two cross
-    predictors operate on the complete 128-dimensional latent representation.
+    Cross-view predictors operate only on the common representation.  A
+    view-specific latent is intentionally not imputed because information that
+    is unique to one view is not identifiable from the other view.
     """
 
     def __init__(self, input_dims: list[int], num_clusters: int = 5):
@@ -89,10 +90,11 @@ class CausalMVC(nn.Module):
         del _legacy_initialization_only
         initial_prototypes = F.normalize(torch.randn(num_clusters, COMMON_DIM), dim=1)
         self.register_buffer("prototypes", initial_prototypes)
+        self.register_buffer("imputation_confidence", torch.zeros(2))
         self.cross_predictors = nn.ModuleList(
             (
-                MLP([LATENT_DIM, LATENT_DIM, LATENT_DIM]),  # view 0 -> view 1
-                MLP([LATENT_DIM, LATENT_DIM, LATENT_DIM]),  # view 1 -> view 0
+                MLP([COMMON_DIM, COMMON_DIM, COMMON_DIM]),  # view 0 -> view 1
+                MLP([COMMON_DIM, COMMON_DIM, COMMON_DIM]),  # view 1 -> view 0
             )
         )
 
@@ -121,28 +123,55 @@ class CausalMVC(nn.Module):
         return ModelOutput(latents, commons, specifics, reconstructions)
 
     @torch.no_grad()
-    def complete_latents(
+    def complete_commons(
         self, views: list[torch.Tensor], mask: torch.Tensor
-    ) -> list[torch.Tensor]:
-        """Fill a missing view in latent space from the observed other view."""
+    ) -> tuple[list[torch.Tensor], list[torch.Tensor]]:
+        """Predict only the missing common representation in both directions."""
 
         output = self(views)
-        completed = [output.latents[0].clone(), output.latents[1].clone()]
+        completed = [output.commons[0].clone(), output.commons[1].clone()]
         missing_view0 = ~mask[:, 0]
         missing_view1 = ~mask[:, 1]
         completed[0][missing_view0] = self.cross_predictors[1](
-            output.latents[1][missing_view0]
+            output.commons[1][missing_view0]
         )
         completed[1][missing_view1] = self.cross_predictors[0](
-            output.latents[0][missing_view1]
+            output.commons[0][missing_view1]
         )
-        return completed
+        return completed, output.commons
+
+    @torch.no_grad()
+    def calibrate_imputation_confidence(
+        self, views: list[torch.Tensor], mask: torch.Tensor
+    ) -> torch.Tensor:
+        """Estimate direction-wise reliability on genuinely paired samples."""
+
+        output = self(views)
+        paired = mask.all(dim=1)
+        confidence = output.commons[0].new_zeros(2)
+        if paired.any():
+            predicted1 = self.cross_predictors[0](output.commons[0][paired])
+            predicted0 = self.cross_predictors[1](output.commons[1][paired])
+            confidence[0] = F.cosine_similarity(
+                predicted0, output.commons[0][paired]
+            ).mean().clamp(0.0, 1.0)
+            confidence[1] = F.cosine_similarity(
+                predicted1, output.commons[1][paired]
+            ).mean().clamp(0.0, 1.0)
+        self.imputation_confidence.copy_(confidence)
+        return confidence.clone()
 
     @torch.no_grad()
     def completed_common(self, views: list[torch.Tensor], mask: torch.Tensor) -> torch.Tensor:
-        """Return the final common-only representation used by KMeans."""
+        """Return a confidence-weighted completed common representation."""
 
-        completed = self.complete_latents(views, mask)
-        common0 = self.split_latent(completed[0], 0)[0]
-        common1 = self.split_latent(completed[1], 1)[0]
-        return F.normalize((common0 + common1) / 2, dim=1)
+        completed, _ = self.complete_commons(views, mask)
+        observed_weight = torch.ones(len(mask), device=mask.device, dtype=completed[0].dtype)
+        weight0 = torch.where(mask[:, 0], observed_weight, self.imputation_confidence[0])
+        weight1 = torch.where(mask[:, 1], observed_weight, self.imputation_confidence[1])
+        denominator = (weight0 + weight1).clamp_min(1e-8).unsqueeze(1)
+        fused = (
+            completed[0] * weight0.unsqueeze(1)
+            + completed[1] * weight1.unsqueeze(1)
+        ) / denominator
+        return F.normalize(fused, dim=1)

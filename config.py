@@ -1,9 +1,21 @@
-"""Small, explicit configuration for the stable BDGP experiment."""
+"""Small, explicit configuration for the fixed dataset-selection protocol."""
 
 from __future__ import annotations
 
 import argparse
 from dataclasses import asdict, dataclass
+from pathlib import Path
+
+
+OUTPUT_ROOT = Path(__file__).resolve().parent / "outputs" / "st_mcc_stable_v2"
+
+
+def output_dir_for_dataset(dataname: str) -> str:
+    """Return the fixed output directory for a dataset name or MAT path."""
+
+    dataset_name = Path(dataname).stem
+    safe_name = dataset_name.strip().lower().replace("-", "_").replace(" ", "_")
+    return str(OUTPUT_ROOT / safe_name)
 
 
 @dataclass(frozen=True)
@@ -14,11 +26,11 @@ class Config:
     stable recipe and stay next to the code that uses them.
     """
 
-    data: str = r"D:\Data_Mining\Code\Datasets\BDGP\BDGP.mat"
-    output: str = "outputs/bdgp_clean"
+    data: str = "DHA"
+    output: str = str(OUTPUT_ROOT / "dha")
     seed: int = 61
     mask_seed: int | None = None
-    missing_rate: float = 0.5
+    missing_rate: float = 0.1
     batch_size: int = 256
     learning_rate: float = 1e-3
     pretrain_epochs: int = 20
@@ -26,7 +38,9 @@ class Config:
 
     @property
     def epochs(self) -> int:
-        return self.pretrain_epochs + self.joint_epochs
+        """Base schedule before dataset-size minimum-step expansion."""
+
+        return self.pretrain_epochs + 2 * self.joint_epochs
 
     @property
     def effective_mask_seed(self) -> int:
@@ -52,13 +66,12 @@ class Config:
 def parse_config() -> Config:
     """Keep the command line small; edit Config only for development settings."""
 
-    parser = argparse.ArgumentParser(description="Train the clean CausalMVC BDGP model")
-    parser.add_argument("--data", default=Config.data)
-    parser.add_argument("--output", default=Config.output)
+    parser = argparse.ArgumentParser(description="Train ST-MCC with the fixed default protocol")
+    parser.add_argument("--dataname", "--data", dest="data", default=Config.data)
     parser.add_argument("--seed", type=int, default=Config.seed)
     parser.add_argument("--mask-seed", type=int, default=None)
     parser.add_argument("--missing-rate", type=float, default=Config.missing_rate)
     args = parser.parse_args()
-    config = Config(**vars(args))
+    config = Config(output=output_dir_for_dataset(args.data), **vars(args))
     config.validate()
     return config
