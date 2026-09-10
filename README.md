@@ -1,7 +1,7 @@
 # ST-MCC
 
 ST-MCC: Structure-Teacher-Guided Multi-Level Consistency Learning and Cross-View Latent Completion for Incomplete Multi-View Clustering
-## 文件职责
+## File Responsibility
 
 | File | Responsibility |
 |---|---|
